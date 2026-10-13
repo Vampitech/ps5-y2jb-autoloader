@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.0.1
+- Fixed Relapse reporting "reboot the PS5 first" on a console that was already rebooted
+
 ## v1.0.0
 - Added [Relapse](https://github.com/edisnord/relapse-y2jb) - thanks to [edisnord](https://github.com/edisnord)
   - Preferred exploit for FW 8.00–13.60 (except 9.05 and 11.40) when an active network connection (Wi-Fi or Ethernet) is detected
