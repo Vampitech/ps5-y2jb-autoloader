@@ -1196,7 +1196,7 @@ function trigger() {
         let exploit_success = false;
 
         const has_net = has_network_interface();
-        const relapse_supported = compare_version(FW_VERSION, "8.00") >= 0 &&
+        const relapse_supported = compare_version(FW_VERSION, "7.00") >= 0 &&
                                   compare_version(FW_VERSION, "13.60") <= 0 &&
                                   FW_VERSION !== "9.05" &&
                                   FW_VERSION !== "11.40";

