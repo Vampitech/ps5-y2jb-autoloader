@@ -5,8 +5,6 @@ async function start_relapse() {
         const WORKER_STACK_PASS = 0x2000n;
         const WORKER_CORE = "other";
         const CHAIN_TIMEOUT_MS = 20000;
-        const FAIL_MARKER_NAME = "relapse.fail";
-        const IGNORE_FAIL_MARKER = false;
         const RESTORE_EBOOT_AFTER_HANDOFF = true;
         const PREPARE_FOR_KEXP = true;
         const WIDEN_EBOOT = true;
@@ -6300,21 +6298,6 @@ async function start_relapse() {
                     " (this major version)" : picked.known.join(", ")));
         log_now("FW " + fw + " offsets loaded (allproc rva " +
             toHex(BigInt(off.allproc)) + ", aio uaf)");
-        let failcheck_path = null;
-        try {
-            failcheck_path = "/" + get_nidpath() + "/common_temp/" + FAIL_MARKER_NAME;
-        } catch (_) { }
-        try {
-            const present = failcheck_path ? file_exists(failcheck_path) : false;
-            if (present && IGNORE_FAIL_MARKER) {
-                log_now("fail marker present (" + failcheck_path +
-                    ") but IGNORE_FAIL_MARKER is set - continuing anyway");
-            } else if (present) {
-                send_notification("relapse already ran this boot\nreboot the PS5 first");
-                say("fail marker present (" + failcheck_path + ") - reboot before retrying");
-                return false;
-            }
-        } catch (_) { }
         const chain = new Y2Chain(p);
         await probe_worker_chain(chain);
         const exploit = new KernelExploit(p, chain, say, off);
@@ -6336,17 +6319,6 @@ async function start_relapse() {
             chain.setWorkerAffinity(core, 2 /* PRI_REALTIME */);
             say("race pinned: main core " + this.pinnedCore + ", worker core " + core);
         };
-        if (failcheck_path) {
-            try {
-                write_file(failcheck_path, "");
-                if (!file_exists(failcheck_path)) failcheck_path = null;
-            } catch (_) {
-                failcheck_path = null;
-            }
-        }
-        if (failcheck_path) say("fail marker armed at " + failcheck_path);
-        else say("could not write a one-run-per-boot marker to the sandbox " +
-            "common_temp dir - continuing without that safety net");
         let result = null;
         let threw = null;
         if (STOP_AFTER === "chain") {
@@ -6375,12 +6347,6 @@ async function start_relapse() {
             say("close() summary: " + results.join(" | ") + "  (0 = closed)");
         }
         if (!result || !result.payloads) {
-            if (!threw && failcheck_path) {
-                try {
-                    syscall(SYSCALL.unlink, alloc_string(failcheck_path));
-                    say("fail marker cleared - safe to retry");
-                } catch (_) { }
-            }
             if (threw) {
                 say("exception: " + (threw.message || threw));
                 send_notification("relapse FAILED\n" + (threw.message || threw));
