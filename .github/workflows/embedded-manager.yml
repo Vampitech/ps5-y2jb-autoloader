@@ -1,0 +1,42 @@
+name: Build with embedded Payload Manager
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload_manager_version:
+        description: 'Release tag (for example v0.6.1), latest, or blank to use payload-manager.version'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout pinned submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Build embedded manager package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_VERSION: ${{ inputs.payload_manager_version }}
+        run: bash scripts/build_embedded_manager.sh "$REQUESTED_VERSION"
+      - name: Upload update package and build manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: y2jb-embedded-manager-${{ github.run_number }}
+          path: |
+            y2jb_update.zip
+            embedded-build-manifest.txt
+          if-no-files-found: error
